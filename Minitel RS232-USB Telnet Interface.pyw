@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # Minitel RS232/USB Telnet Interface
-# Updated: auto-connect (max speed), improved GUI/console, .vdt recording & sending
-# v0.2.2
 
 import sys, subprocess, time, threading, traceback
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-version = "0.2"
+version = "0.2.1"
 
 # --- Dependencies -------------------------------------------------------------
 try:
@@ -39,12 +37,12 @@ record_buffer = bytearray()
 # --- Videotex init sequences --------------------------------------------------
 def build_init_sequence():
     """
-    - disable local echo
-    - hide cursor
-    - clear screen
-    - clear line 0 (twice for safety)
-    - select G1
-    - HOME cursor to 0,0 (0x1E)
+    Init stream WITHOUT G1 selection:
+     - disable local echo
+     - hide cursor
+     - clear screen
+     - clear line 0 (twice)
+     - HOME cursor (0,0) with 0x1E
     """
     return (
         b'\x1B\x3B\x60\x58\x52'  # disable local echo
@@ -52,7 +50,6 @@ def build_init_sequence():
         b'\x0C'                  # clear screen
         b'\x1F\x40\x41'          # US row=0 col=1
         b'\x18\x18'              # EL x2 (clear line 0)
-        b'\x0E'                  # SO -> G1 mosaic
         b'\x1E'                  # RS -> home cursor to 0,0
     )
 
@@ -63,9 +60,9 @@ def build_disable_echo_sequence():
 # --- Model detection & max speed ---------------------------------------------
 def detect_and_configure_minitel(port_name, set_speed_on_terminal=True):
     """
-    Probe common speeds to read the Minitel 'who are you' answer (ESC 9 {).
-    If found, determine target max speed and (optionally) send ESC : k to set it.
-    Does NOT change 7E1/8N1 automatically; framing stays user-controlled.
+    Probe 7E1 at 1200/4800/9600 to read 'ESC 9 {' response.
+    Optionally set target speed on terminal via ESC : k (does not change framing).
+    PC framing is NEVER changed here (we keep 7E1).
     """
     import time
     types = {
@@ -85,10 +82,11 @@ def detect_and_configure_minitel(port_name, set_speed_on_terminal=True):
         0x79: ("Minitel 5", 1200),
         0x7A: ("Minitel 12", 1200),
     }
+    # PROBE 7E1 ONLY (including 9600)
     probe = [
         (1200, serial.SEVENBITS, serial.PARITY_EVEN),
         (4800, serial.SEVENBITS, serial.PARITY_EVEN),
-        (9600, serial.EIGHTBITS, serial.PARITY_NONE),
+        (9600, serial.SEVENBITS, serial.PARITY_EVEN),
     ]
     for baud, bits, parity in probe:
         try:
@@ -112,7 +110,7 @@ def detect_and_configure_minitel(port_name, set_speed_on_terminal=True):
                         )
                         speed_bits = {4800: 0b110, 9600: 0b111}.get(target_speed, 0b100)  # 1200=100
                         config_byte = (1 << 6) | (speed_bits << 3) | speed_bits  # P=0,1,E,R
-                        s2.write(b'\x1B\x3A\x6B' + bytes([config_byte]))  # ESC : k
+                        s2.write(b'\x1B\x3A\x6B' + bytes([config_byte]))  # ESC : k -> set speed
                         time.sleep(0.2)
                         s2.close()
                     except Exception:
@@ -141,13 +139,13 @@ def open_gui():
     encoding_var = tk.StringVar(value="hexadecimal")
 
     auto_connect_var = tk.BooleanVar(value=True)      # auto-detect model & max speed
-    disable_echo_preconnect_var = tk.BooleanVar(value=True)  # NEW: send echo-off before connect
+    disable_echo_preconnect_var = tk.BooleanVar(value=True)  # send echo-off before connect
     poll_interval_var = tk.DoubleVar(value=0.06)      # serial poll interval (s)
 
     # Recording options
     record_bidir_var = tk.BooleanVar(value=False)
     record_wrap_stxetx_var = tk.BooleanVar(value=False)
-    record_prepend_init_var = tk.BooleanVar(value=True)   # NEW: default True as requested
+    record_prepend_init_var = tk.BooleanVar(value=True)   # default ON for better playback
 
     send_prepend_init_var = tk.BooleanVar(value=False)    # optional when sending a .vdt file
 
@@ -277,14 +275,18 @@ def open_gui():
             log_message("Error: No COM port selected.")
             return
 
-        # Auto-detect (does NOT change framing)
+        # Auto-detect (does NOT change PC framing)
         if auto_connect_var.get():
             model, target_speed = detect_and_configure_minitel(
                 com_port,
                 set_speed_on_terminal=True
             )
             baudrate_var.set(target_speed)
-            log_message(f"Auto-detect: {model} — target speed set to {target_speed} bps.")
+            # Force 7E1 on PC side regardless of target speed
+            data_bits_var.set(7)
+            parity_var.set("Even")
+            stop_bits_var.set(1)
+            log_message(f"Auto-detect: {model} — speed set to {target_speed} bps; framing kept at 7E1.")
 
         baudrate = baudrate_var.get()
         data_bits = data_bits_var.get()
@@ -313,7 +315,7 @@ def open_gui():
         globals()['ser'] = ser_local
         log_message("Serial connection established.")
 
-        # NEW: disable local echo before connecting (if requested)
+        # Disable local echo before connecting (if requested)
         if disable_echo_preconnect_var.get():
             try:
                 ser.write(build_disable_echo_sequence())
@@ -400,11 +402,10 @@ def open_gui():
         data, had_frame = strip_stx_etx(data)
         if had_frame:
             log_message("Detected STX/ETX in file — stripped before sending.")
-
         if send_prepend_init_var.get():
             data = build_init_sequence() + data
 
-        # Ensure serial is open; if not, try opening with current settings
+        # Ensure serial is open; if not, open with current settings
         temp_opened = False
         if not ser or not ser.is_open:
             selected = com_port_var.get()
@@ -430,7 +431,6 @@ def open_gui():
                 log_message(f"Serial open error: {e}")
                 return
 
-        # Send in chunks
         try:
             t0 = time.time()
             CHUNK = 1024
@@ -454,7 +454,6 @@ def open_gui():
                     pass
 
     # --- Layout ---------------------------------------------------------------
-    # Top settings grid
     r = 0
     tk.Label(window, text="COM Port:").grid(row=r, column=0, sticky="w", padx=8, pady=4)
     com_port_menu = ttk.Combobox(window, textvariable=com_port_var, values=list_serial_ports(), state='readonly')
@@ -519,7 +518,6 @@ def open_gui():
     show_messages_checkbox.grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=4)
 
     r += 1
-    # Buttons row
     btns = tk.Frame(window)
     btns.grid(row=r, column=0, columnspan=3, sticky="ew", padx=8, pady=8)
     start_button = tk.Button(btns, text="Start connection", command=start_connection)
@@ -530,18 +528,16 @@ def open_gui():
     send_vdt_btn.pack(side="left", padx=4)
 
     r += 1
-    # Recording controls above console
     rec_frame = ttk.LabelFrame(window, text="Recording (.vdt)")
     rec_frame.grid(row=r, column=0, columnspan=3, sticky="ew", padx=8, pady=6)
     record_button = tk.Button(rec_frame, text="Start recording", command=lambda: toggle_recording())
     record_button.grid(row=0, column=0, sticky="w", padx=6, pady=4)
     tk.Checkbutton(rec_frame, text="Bidirectional (include Minitel→Server)", variable=record_bidir_var).grid(row=0, column=1, sticky="w", padx=6, pady=4)
     tk.Checkbutton(rec_frame, text="Wrap with STX/ETX", variable=record_wrap_stxetx_var).grid(row=1, column=0, sticky="w", padx=6, pady=2)
-    tk.Checkbutton(rec_frame, text="Prepend init (echo off, cursor off, CLS, clear line 0, G1, HOME)", variable=record_prepend_init_var).grid(row=1, column=1, sticky="w", padx=6, pady=2)
+    tk.Checkbutton(rec_frame, text="Prepend init (echo off, cursor off, CLS, clear line 0, HOME)", variable=record_prepend_init_var).grid(row=1, column=1, sticky="w", padx=6, pady=2)
     tk.Checkbutton(rec_frame, text="Prepend init when sending .vdt", variable=send_prepend_init_var).grid(row=1, column=2, sticky="w", padx=6, pady=2)
 
     r += 1
-    # Console frame (Text + scrollbar) at the bottom
     console_frame = tk.Frame(window)
     console_frame.grid(row=r, column=0, columnspan=3, sticky="nsew", padx=8, pady=8)
     console_text = tk.Text(console_frame, height=14, state='disabled', wrap='word')
@@ -550,20 +546,18 @@ def open_gui():
     console_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     console_text['yscrollcommand'] = console_scrollbar.set
 
-    # Column/row weights
     window.columnconfigure(0, weight=1)
     window.columnconfigure(1, weight=1)
     window.columnconfigure(2, weight=0)
     window.rowconfigure(r, weight=1)  # console expands
 
-    # Defaults
+    # Defaults (7E1)
     baudrate_var.set(1200)
     data_bits_var.set(7)
     parity_var.set("Even")
     stop_bits_var.set(1)
     toggle_manual_fields()
 
-    # Intro log
     log_message(f"Minitel RS232/USB Telnet Interface v{version}")
     log_message("---")
     log_message("Modes on terminal:")
